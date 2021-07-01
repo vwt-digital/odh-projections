@@ -1,0 +1,13 @@
+---
+steps:
+  - name: 'eu.gcr.io/vwt-p-gew1-dat-cloudbuilders/cloudbuilder-function-deploy:latest'
+    id: 'deploy-restingest'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        function_deploy.py ${PROJECT_ID}-consumer-for-projection-func \
+          --project="${PROJECT_ID}" \
+          --invoker="$(cat consume_for_projection_func_permissions.txt)" \
+          --trigger-http
+    dir: 'functions/conume_for_projection'
