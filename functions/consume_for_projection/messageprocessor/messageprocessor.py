@@ -1,41 +1,50 @@
+import json
 import logging
+import os
 import sys
 
 from config import FIELDS_TO_SKIP
-
-# from gobits import Gobits
-# from google.cloud import pubsub_v1
 
 logging.basicConfig(level=logging.INFO)
 
 
 class MessageProcessor(object):
     def __init__(self):
-        print("joe")
+        self.topic_name = os.environ.get("TOPIC_NAME")
+        if not self.topic_name:
+            logging.error("Environment variable 'TOPIC_NAME' should be set")
+            sys.exit(1)
+        self.schema_file_path = os.environ.get("SCHEMA_FILE_PATH")
+        if not self.schema_file_path:
+            logging.error("Environment variable 'SCHEMA_FILE_PATH' should be set")
+            sys.exit(1)
         self.original_object = None
 
     def process(self, payload):
         # Get schema
-        # TODO: replace with schema API
-        schema = "schema.json"
+        with open(self.schema_file_path, "r") as f:
+            schema = json.load(f)
         # Get properties of schema
         self.original_object = schema.get("properties")
         if not self.original_object:
             sys.exit(0)
         # Make lists of fields in schema
-        current_field_list, schema_field_list = self.list_of_schema_fields(
+        current_field_list, schema_field_lists = self.list_of_schema_fields(
             self.original_object, [], []
         )
         # Check if last value does not have sub fields and if it has, remove them
-        schema_field_list_copy = []
-        for sf in schema_field_list:
-            sf_copy = []
-            for field in sf:
-                sf_copy.append(field)
-            schema_field_list_copy.append(sf_copy)
-        schema_field_list = self.remove_if_subfields(
-            schema_field_list, schema_field_list_copy
+        schema_field_lists_copy = self.copy_list_of_lists(schema_field_lists)
+        schema_field_lists = self.remove_if_subfields(
+            schema_field_lists, schema_field_lists_copy
         )
+        # collection_name = f"projection_{self.topic_name}"
+        # Remove values in message that are not conform schema
+        self.clean_message(schema_field_lists, payload, 0)
+        # Check if values are missing from message that should be there
+        for schema_field_list in schema_field_lists:
+            check = self.check_for_missing_values_message(schema_field_list, payload)
+            if check is False:
+                break
 
     #     message = payload["message"]
     #     if self.process_message(message) is False:
@@ -104,7 +113,9 @@ class MessageProcessor(object):
         # For every list of fields (e.g. a path to a field)
         for i in range(len(json_fields)):
             # Get last value of path in original json object
-            last_value = self.get_last_value(json_fields[i], self.original_object)
+            last_value = self.get_last_value_schema(
+                json_fields[i], self.original_object
+            )
             # Check if last value is a json object
             if isinstance(last_value, dict):
                 # If it is, make sure it does not have any subfields
@@ -115,7 +126,7 @@ class MessageProcessor(object):
             del original_json_fields[to_rem_item]
         return original_json_fields
 
-    def get_last_value(self, field_list, last_object):
+    def get_last_value_schema(self, field_list, last_object):
         # Get first field in path of fields
         new_field = field_list.pop(0)
         type_object = last_object.get("type")
@@ -143,7 +154,7 @@ class MessageProcessor(object):
             last_value = new_object
         # If the field returns a new last object, run the function recursively on this new last object
         elif new_object:
-            last_value = self.get_last_value(field_list, new_object)
+            last_value = self.get_last_value_schema(field_list, new_object)
         # If the new last current object cannot be found via the path, the path is wrong
         elif not new_object:
             logging.error(
@@ -151,3 +162,96 @@ class MessageProcessor(object):
             )
             sys.exit(1)
         return last_value
+
+    def get_last_value_object(self, field_list, last_object, fields_until_now):
+        # Get first field in path of fields
+        new_field = field_list.pop(0)
+        # Check if object is list according to schema
+        value_in_schema = self.get_last_value_schema(
+            fields_until_now, self.original_object
+        )
+        fields_until_now.append(new_field)
+        type_of_field = value_in_schema.get("type")
+        if type_of_field == "array":
+            last_value = []
+            for lo in last_object:
+                # Check if field_list is empty because that is the end of the object
+                if not field_list:
+                    last_value.append(lo[new_field])
+                else:
+                    last_object = lo[new_field]
+                    last_value.append(
+                        self.get_last_value_object(field_list, lo, fields_until_now)
+                    )
+        else:
+            # Check if field_list is empty because that is the end of the object
+            if not field_list:
+                last_value = last_object[new_field]
+            else:
+                last_object = last_object[new_field]
+                last_value = self.get_last_value_object(
+                    field_list, last_object, fields_until_now
+                )
+        return last_value
+
+    def clean_message(self, schema_field_lists, message, message_depth):  # noqa: C901
+        # Check if the message is a list because only objects can be checked
+        if isinstance(message, list):
+            for m in message:
+                self.clean_message(schema_field_lists, m, message_depth)
+        else:
+            # For every key in the message
+            for key in list(message.keys()):
+                if key in FIELDS_TO_SKIP:
+                    continue
+                in_list = False
+                # Check if the key can be found in the list with schema fields and if it has the right depth
+                for schema_field_list in schema_field_lists:
+                    for i in range(len(schema_field_list)):
+                        if i == message_depth and schema_field_list[i] == key:
+                            in_list = True
+                            break
+                    if in_list is True:
+                        break
+                # If it cannot be found in the schema fields list, delete it
+                if in_list is False:
+                    del message[key]
+                # If it can, check if the key has an object or list as value
+                # Because if it does, the value needs to be checked as well
+                if key in message:
+                    if isinstance(message[key], list) or isinstance(message[key], dict):
+                        self.clean_message(
+                            schema_field_lists, message[key], message_depth + 1
+                        )
+
+    def check_for_missing_values_message(self, schema_field_list, message):
+        good_message = True
+        # For every schema field
+        for i in range(len(schema_field_list)):
+            # Check if the message is a list
+            if isinstance(message, list):
+                # If it is a list, recursively call the function with every object in the list
+                for m in message:
+                    good_message = self.check_for_missing_values_message(
+                        schema_field_list[i:], m
+                    )
+                    if good_message is False:
+                        break
+            # If it is not a list
+            else:
+                # Check if the schema field can be found in the message
+                if schema_field_list[i] not in message:
+                    good_message = False
+                    break
+                else:
+                    message = message[schema_field_list[i]]
+        return good_message
+
+    def copy_list_of_lists(self, list_to_copy):
+        copied_list = []
+        for a_list in list_to_copy:
+            a_list_copy = []
+            for value in a_list:
+                a_list_copy.append(value)
+            copied_list.append(a_list_copy)
+        return copied_list
