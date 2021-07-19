@@ -26,16 +26,16 @@ class MessageProcessor(object):
             schema = json.load(f)
         # Get properties of schema
         self.original_object = schema.get("properties")
+        original_object_required_list = schema.get("required")
         if not self.original_object:
             sys.exit(0)
         # Make lists of fields in schema
         current_field_list, schema_field_lists = self.list_of_schema_fields(
-            self.original_object, [], []
+            self.original_object, [], [], 0, original_object_required_list
         )
         # Check if last value does not have sub fields and if it has, remove them
-        schema_field_lists_copy = self.copy_list_of_lists(schema_field_lists)
         schema_field_lists = self.remove_if_subfields(
-            schema_field_lists, schema_field_lists_copy
+            schema_field_lists, schema_field_lists
         )
         # collection_name = f"projection_{self.topic_name}"
         # Remove values in message that are not conform schema
@@ -45,46 +45,51 @@ class MessageProcessor(object):
             check = self.check_for_missing_values_message(schema_field_list, payload)
             if check is False:
                 break
+        if check is False:
+            logging.info("Message not conform schema, skipping")
+            sys.exit(0)
+        # Put message into database
 
-    #     message = payload["message"]
-    #     if self.process_message(message) is False:
-    #         logging.info("Message not processed")
-    #     else:
-    #         logging.info("Message is processed")
-
-    # def process_message(self, message):
-    #     return True
-
-    def list_of_schema_fields(self, json_object, current_field_list, current_list):
+    def list_of_schema_fields(
+        self, json_object, current_field_list, current_list, depth, required_list
+    ):
         if isinstance(json_object, dict):
             type_object = json_object.get("type")
             # If type_object is a dictionary, it is a subfield, not an information field
             if isinstance(type_object, dict):
                 # Create the path to the current field and add it to current list of all paths to field
                 current_field_list, json_object, current_list = self.add_path(
-                    current_field_list, json_object, current_list
+                    current_field_list, json_object, current_list, depth, required_list
                 )
             # Check if type of object is array, if it is get its items to get its subfields
             elif type_object == "array":
                 json_object = json_object["items"]
                 current_field_list, current_list = self.list_of_schema_fields(
-                    json_object, current_field_list, current_list
+                    json_object, current_field_list, current_list, depth, required_list
                 )
             # Check if type of object is object, if it is get its properties to get its subfields
             elif type_object == "object":
+                required_list = json_object.get("required")
                 json_object = json_object["properties"]
                 current_field_list, current_list = self.list_of_schema_fields(
-                    json_object, current_field_list, current_list
+                    json_object,
+                    current_field_list,
+                    current_list,
+                    depth + 1,
+                    required_list,
                 )
             # If object does not have a type field, it is an object with subfields
             elif not type_object:
                 # Create the path to the current field and add it to current list of all paths to field
                 current_field_list, json_object, current_list = self.add_path(
-                    current_field_list, json_object, current_list
+                    current_field_list, json_object, current_list, depth, required_list
                 )
+                depth = 0
         return current_field_list, current_list
 
-    def add_path(self, current_field_list, json_object, current_list):
+    def add_path(
+        self, current_field_list, json_object, current_list, depth, required_list
+    ):
         # Hard copy the current field list
         current_field_list_copy = []
         for cf in current_field_list:
@@ -93,11 +98,24 @@ class MessageProcessor(object):
         for field in json_object:
             if field in FIELDS_TO_SKIP:
                 continue
+            is_required = False
+            if required_list:
+                is_required = field in required_list
             # Add it to the fields that came before it
-            current_field_list.append(field)
+            field_object = {
+                "field": field,
+                "type": json_object[field].get("type"),
+                "depth": depth,
+                "is_required": is_required,
+            }
+            current_field_list.append(field_object)
             # Recursively run function on object in field to check if it has subfields
             current_field_list, current_list = self.list_of_schema_fields(
-                json_object[field], current_field_list, current_list
+                json_object[field],
+                current_field_list,
+                current_list,
+                depth,
+                required_list,
             )
             # Add the new list with fields that came before this field (including this field) to the list with all the lists
             current_list.append(current_field_list)
@@ -128,7 +146,7 @@ class MessageProcessor(object):
 
     def get_last_value_schema(self, field_list, last_object):
         # Get first field in path of fields
-        new_field = field_list.pop(0)
+        new_field = field_list[0]["field"]
         type_object = last_object.get("type")
         # If field type is array or object, the new field will return nothing
         # if used to get the new object from the last object
@@ -150,11 +168,11 @@ class MessageProcessor(object):
         # Get the new last current object by getting it via the first value in the path of fields list
         new_object = last_object.get(new_field)
         # If the path of fields is now empty, the last value (object) of the field path is found
-        if not field_list:
+        if not field_list[1:]:
             last_value = new_object
         # If the field returns a new last object, run the function recursively on this new last object
         elif new_object:
-            last_value = self.get_last_value_schema(field_list, new_object)
+            last_value = self.get_last_value_schema(field_list[1:], new_object)
         # If the new last current object cannot be found via the path, the path is wrong
         elif not new_object:
             logging.error(
@@ -165,7 +183,7 @@ class MessageProcessor(object):
 
     def get_last_value_object(self, field_list, last_object, fields_until_now):
         # Get first field in path of fields
-        new_field = field_list.pop(0)
+        new_field = field_list[0]
         # Check if object is list according to schema
         value_in_schema = self.get_last_value_schema(
             fields_until_now, self.original_object
@@ -176,21 +194,21 @@ class MessageProcessor(object):
             last_value = []
             for lo in last_object:
                 # Check if field_list is empty because that is the end of the object
-                if not field_list:
+                if not field_list[1:]:
                     last_value.append(lo[new_field])
                 else:
                     last_object = lo[new_field]
                     last_value.append(
-                        self.get_last_value_object(field_list, lo, fields_until_now)
+                        self.get_last_value_object(field_list[1:], lo, fields_until_now)
                     )
         else:
             # Check if field_list is empty because that is the end of the object
-            if not field_list:
+            if not field_list[1:]:
                 last_value = last_object[new_field]
             else:
                 last_object = last_object[new_field]
                 last_value = self.get_last_value_object(
-                    field_list, last_object, fields_until_now
+                    field_list[1:], last_object, fields_until_now
                 )
         return last_value
 
@@ -207,8 +225,11 @@ class MessageProcessor(object):
                 in_list = False
                 # Check if the key can be found in the list with schema fields and if it has the right depth
                 for schema_field_list in schema_field_lists:
-                    for i in range(len(schema_field_list)):
-                        if i == message_depth and schema_field_list[i] == key:
+                    for schema_field in schema_field_list:
+                        if (
+                            schema_field["depth"] == message_depth
+                            and schema_field["field"] == key
+                        ):
                             in_list = True
                             break
                     if in_list is True:
@@ -225,33 +246,27 @@ class MessageProcessor(object):
                         )
 
     def check_for_missing_values_message(self, schema_field_list, message):
-        good_message = True
-        # For every schema field
-        for i in range(len(schema_field_list)):
-            # Check if the message is a list
-            if isinstance(message, list):
-                # If it is a list, recursively call the function with every object in the list
-                for m in message:
-                    good_message = self.check_for_missing_values_message(
-                        schema_field_list[i:], m
-                    )
-                    if good_message is False:
-                        break
-            # If it is not a list
-            else:
-                # Check if the schema field can be found in the message
-                if schema_field_list[i] not in message:
-                    good_message = False
+        check = True
+        # Check if the message is a list because only objects can be checked
+        if isinstance(message, list):
+            for m in message:
+                check = self.check_for_missing_values_message(schema_field_list, m)
+                if check is False:
                     break
+        else:
+            # If there is still a value in de schema field list, there should still be a field in the message
+            if schema_field_list:
+                schema_field_obj = schema_field_list[0]
+                schema_field = schema_field_obj["field"]
+                schema_field_required = schema_field_obj["is_required"]
+                # If field is not in message, check is false
+                if schema_field not in message:
+                    if schema_field_required is True:
+                        check = False
                 else:
-                    message = message[schema_field_list[i]]
-        return good_message
-
-    def copy_list_of_lists(self, list_to_copy):
-        copied_list = []
-        for a_list in list_to_copy:
-            a_list_copy = []
-            for value in a_list:
-                a_list_copy.append(value)
-            copied_list.append(a_list_copy)
-        return copied_list
+                    # Else check the value of the field
+                    new_object_to_check = message[schema_field]
+                    check = self.check_for_missing_values_message(
+                        schema_field_list[1:], new_object_to_check
+                    )
+        return check
