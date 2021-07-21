@@ -4,6 +4,8 @@ import os
 import sys
 
 from config import FIELDS_TO_SKIP
+from firestore import upload_to_firestore
+from google.cloud import firestore as gcp_firestore
 
 logging.basicConfig(level=logging.INFO)
 
@@ -19,6 +21,7 @@ class MessageProcessor(object):
             logging.error("Environment variable 'SCHEMA_FILE_PATH' should be set")
             sys.exit(1)
         self.original_object = None
+        self.database = gcp_firestore.Client()
 
     def process(self, payload):
         # Get schema
@@ -31,27 +34,59 @@ class MessageProcessor(object):
             sys.exit(0)
         # Make lists of fields in schema
         current_field_list, schema_field_lists = self.list_of_schema_fields(
-            self.original_object, [], [], 0, original_object_required_list
+            self.original_object, [], [], 0, original_object_required_list, ""
         )
         # Check if last value does not have sub fields and if it has, remove them
         schema_field_lists = self.remove_if_subfields(
             schema_field_lists, schema_field_lists
         )
-        # collection_name = f"projection_{self.topic_name}"
         # Remove values in message that are not conform schema
         self.clean_message(schema_field_lists, payload, 0)
         # Check if values are missing from message that should be there
+        primary_key = ""
         for schema_field_list in schema_field_lists:
             check = self.check_for_missing_values_message(schema_field_list, payload)
             if check is False:
                 break
+            for schema_field in schema_field_list:
+                if schema_field["is_primary_key"] is True:
+                    primary_key = schema_field["field"]
         if check is False:
             logging.info("Message not conform schema, skipping")
             sys.exit(0)
-        # Put message into database
+        # Create datastore entity
+        # Check if there is a root
+        root = schema_field_lists[0][0]
+        root_exists = all(item[0] == root for item in schema_field_lists)
+        # If there is a root, get the object from the root
+        data_to_add = payload
+        if root_exists:
+            data_to_add = payload[root["field"]]
+        # Check if data to add is a list
+        if isinstance(data_to_add, list):
+            for data_object in data_to_add:
+                # Add the datastore entity to datastore
+                self.add_to_store(data_object, primary_key)
+        else:
+            # Add the datastore entity to datastore
+            self.add_to_store(data_to_add, primary_key)
+
+    def add_to_store(self, data_object, primary_key):
+        collection_name = f"projection_{self.topic_name}"
+        upload_to_firestore_success = upload_to_firestore(
+            self.database, collection_name, data_object, primary_key
+        )
+        if not upload_to_firestore_success:
+            sys.exit(1)
 
     def list_of_schema_fields(
-        self, json_object, current_field_list, current_list, depth, required_list
+        self,
+        json_object,
+        current_field_list,
+        current_list,
+        depth,
+        required_list,
+        primary_key,
     ):
         if isinstance(json_object, dict):
             type_object = json_object.get("type")
@@ -59,17 +94,28 @@ class MessageProcessor(object):
             if isinstance(type_object, dict):
                 # Create the path to the current field and add it to current list of all paths to field
                 current_field_list, json_object, current_list = self.add_path(
-                    current_field_list, json_object, current_list, depth, required_list
+                    current_field_list,
+                    json_object,
+                    current_list,
+                    depth,
+                    required_list,
+                    primary_key,
                 )
             # Check if type of object is array, if it is get its items to get its subfields
             elif type_object == "array":
                 json_object = json_object["items"]
                 current_field_list, current_list = self.list_of_schema_fields(
-                    json_object, current_field_list, current_list, depth, required_list
+                    json_object,
+                    current_field_list,
+                    current_list,
+                    depth,
+                    required_list,
+                    primary_key,
                 )
             # Check if type of object is object, if it is get its properties to get its subfields
             elif type_object == "object":
                 required_list = json_object.get("required")
+                primary_key = json_object.get("primary_key")
                 json_object = json_object["properties"]
                 current_field_list, current_list = self.list_of_schema_fields(
                     json_object,
@@ -77,18 +123,30 @@ class MessageProcessor(object):
                     current_list,
                     depth + 1,
                     required_list,
+                    primary_key,
                 )
             # If object does not have a type field, it is an object with subfields
             elif not type_object:
                 # Create the path to the current field and add it to current list of all paths to field
                 current_field_list, json_object, current_list = self.add_path(
-                    current_field_list, json_object, current_list, depth, required_list
+                    current_field_list,
+                    json_object,
+                    current_list,
+                    depth,
+                    required_list,
+                    primary_key,
                 )
                 depth = 0
         return current_field_list, current_list
 
     def add_path(
-        self, current_field_list, json_object, current_list, depth, required_list
+        self,
+        current_field_list,
+        json_object,
+        current_list,
+        depth,
+        required_list,
+        primary_key,
     ):
         # Hard copy the current field list
         current_field_list_copy = []
@@ -101,12 +159,16 @@ class MessageProcessor(object):
             is_required = False
             if required_list:
                 is_required = field in required_list
+            is_primary_key = False
+            if primary_key:
+                is_primary_key = field == primary_key
             # Add it to the fields that came before it
             field_object = {
                 "field": field,
                 "type": json_object[field].get("type"),
                 "depth": depth,
                 "is_required": is_required,
+                "is_primary_key": is_primary_key,
             }
             current_field_list.append(field_object)
             # Recursively run function on object in field to check if it has subfields
@@ -116,6 +178,7 @@ class MessageProcessor(object):
                 current_list,
                 depth,
                 required_list,
+                primary_key,
             )
             # Add the new list with fields that came before this field (including this field) to the list with all the lists
             current_list.append(current_field_list)
@@ -221,6 +284,7 @@ class MessageProcessor(object):
             # For every key in the message
             for key in list(message.keys()):
                 if key in FIELDS_TO_SKIP:
+                    del message[key]
                     continue
                 in_list = False
                 # Check if the key can be found in the list with schema fields and if it has the right depth
